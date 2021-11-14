@@ -2,14 +2,16 @@ mod test_utils;
 
 use flexi_logger::{
     Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, LogSpecification, Logger, Naming, Record,
-    WriteMode, TS_DASHES_BLANK_COLONS_DOT_BLANK,
+    WriteMode,
 };
 use glob::glob;
+use lazy_static::lazy_static;
 use log::*;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::ops::Add;
 use std::thread::JoinHandle;
+use time::format_description::{self, FormatItem};
 
 const NO_OF_THREADS: usize = 5;
 const NO_OF_LOGLINES_PER_THREAD: usize = 20_000;
@@ -48,7 +50,7 @@ fn multi_threaded() {
     let new_spec = LogSpecification::parse("trace").unwrap();
     std::thread::Builder::new()
         .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             logger2.set_new_spec(new_spec);
             0
         })
@@ -91,7 +93,6 @@ fn do_work(thread_number: usize) {
     for idx in 0..NO_OF_LOGLINES_PER_THREAD {
         debug!("({})  writing out line number {}", thread_number, idx);
     }
-    std::thread::sleep(std::time::Duration::from_millis(500));
     trace!("MUST_BE_PRINTED");
 }
 
@@ -104,6 +105,12 @@ fn wait_for_workers_to_close(worker_handles: Vec<JoinHandle<u8>>) {
     trace!("All worker threads joined.");
 }
 
+const TS_S: &str = "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6] \
+[offset_hour sign:mandatory]:[offset_minute]";
+lazy_static! {
+static ref TS: Vec<FormatItem<'static>> = format_description::parse(TS_S).unwrap(/*ok*/);
+}
+
 pub fn test_format(
     w: &mut dyn std::io::Write,
     now: &mut DeferredNow,
@@ -112,7 +119,7 @@ pub fn test_format(
     write!(
         w,
         "XXXXX [{}] T[{:?}] {} [{}:{}] {}",
-        now.format(TS_DASHES_BLANK_COLONS_DOT_BLANK),
+        now.now().format(&TS).unwrap(),
         std::thread::current().name().unwrap_or("<unnamed>"),
         record.level(),
         record.file().unwrap_or("<unnamed>"),

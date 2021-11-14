@@ -1,17 +1,22 @@
-use super::{Config, RotationConfig};
-use crate::{
-    now_local_or_utc,
-    util::{eprint_err, ERRCODE},
-    Age, Cleanup, Criterion, FileSpec, FlexiLoggerError, Naming,
-};
 use std::cmp::max;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::ops::Add;
 use std::path::{Path, PathBuf};
-use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
+use std::sync::atomic::Ordering;
+
+use time::{format_description, macros::offset, OffsetDateTime};
+
+use crate::{Age, Cleanup, Criterion, FlexiLoggerError, Naming};
+use crate::deferred_now::now_local_or_utc;
+use crate::FileSpec;
+use crate::parameters::SplitAtEveryNewDay;
+use crate::util::{eprint_err, ERRCODE};
+
+use super::{Config, RotationConfig};
 
 const CURRENT_INFIX: &str = "_rCURRENT";
+
 fn number_infix(idx: u32) -> String {
     format!("_r{:0>5}", idx)
 }
@@ -36,7 +41,8 @@ enum NamingState {
 
 #[derive(Debug)]
 enum RollState {
-    Size(u64, u64), // max_size, current_size
+    Size(u64, u64),
+    // max_size, current_size
     Age(Age),
     AgeOrSize(Age, u64, u64), // age, max_size, current_size
 }
@@ -45,6 +51,7 @@ enum MessageToCleanupThread {
     Act,
     Die,
 }
+
 #[derive(Debug)]
 struct CleanupThreadHandle {
     sender: std::sync::mpsc::Sender<MessageToCleanupThread>,
@@ -59,6 +66,7 @@ struct RotationState {
     cleanup: Cleanup,
     o_cleanup_thread_handle: Option<CleanupThreadHandle>,
 }
+
 impl RotationState {
     fn size_rotation_necessary(max_size: u64, current_size: u64) -> bool {
         current_size > max_size
@@ -66,7 +74,36 @@ impl RotationState {
 
     fn age_rotation_necessary(&self, age: Age) -> bool {
         let now = now_local_or_utc();
+        // let now = time::OffsetDateTime::now_local().unwrap();
+        // println!("now is: {}, {:?}", now, now);
         match age {
+            Age::EveryNewDay(SplitAtEveryNewDay { atomic_day_number, utc_offset }) => {
+                // real
+                let current_date = now.to_offset(utc_offset).date();
+                //
+                // // fake data for testing
+                // // let current_date = time::Date::from_calendar_date(2021 + now.second() as i32 / 10 , time::Month::November, current_date.day()).unwrap();
+                let current_date = time::Date::from_calendar_date(
+                    2021 + now.minute() as i32,
+                    time::Month::November,
+                    current_date.day(),
+                ).unwrap();
+                //
+
+                let number_current = crate::deferred_now::offset_date_time_to_year_month_day_number(current_date);
+
+                // println!("fake current_date is: {}, {:?}", current_date, current_date);
+
+                let d = atomic_day_number.load(Ordering::SeqCst);
+                if d == number_current {
+                    // println!("no day change");
+                    return false;
+                } else {
+                    atomic_day_number.store(number_current, Ordering::SeqCst);
+                    // println!("day change, old: {}, new: {}", d, number_current);
+                    true
+                }
+            }
             Age::Day => {
                 self.created_at.year() != now.year()
                     || self.created_at.month() != now.month()
@@ -101,10 +138,10 @@ impl RotationState {
             RollState::Size(max_size, current_size) => {
                 Self::size_rotation_necessary(*max_size, *current_size)
             }
-            RollState::Age(age) => self.age_rotation_necessary(*age),
+            RollState::Age(age) => self.age_rotation_necessary(age.clone()),
             RollState::AgeOrSize(age, max_size, current_size) => {
                 Self::size_rotation_necessary(*max_size, *current_size)
-                    || self.age_rotation_necessary(*age)
+                    || self.age_rotation_necessary(age.clone())
             }
         }
     }
@@ -152,12 +189,13 @@ enum Inner {
     Initial(Option<RotationConfig>, bool),
     Active(Option<RotationState>, Box<dyn Write + Send>),
 }
+
 impl std::fmt::Debug for Inner {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         match self {
             Self::Initial(o_rot, b) => f.write_fmt(format_args!("Initial({:?}, {}) ", o_rot, b)),
             Self::Active(o_rot, _) => {
-                f.write_fmt(format_args!("Active({:?}, <some-writer>) ", o_rot,))
+                f.write_fmt(format_args!("Active({:?}, <some-writer>) ", o_rot, ))
             }
         }
     }
@@ -169,6 +207,7 @@ pub(crate) struct State {
     config: Config,
     inner: Inner,
 }
+
 impl State {
     pub fn try_new(
         config: Config,
@@ -191,12 +230,12 @@ impl State {
                 Some(rotate_config) => {
                     // first rotate, then open the log file
                     let naming_state = match rotate_config.naming {
-                        Naming::Timestamps => {
+                        Naming::Timestamps(utf_offset) => {
                             if !self.config.append {
                                 rotate_output_file_to_date(
                                     &get_creation_date(
                                         &self.config.file_spec.as_pathbuf(Some(CURRENT_INFIX)),
-                                    ),
+                                    ).to_offset(utf_offset),
                                     &self.config,
                                 )?;
                             }
@@ -214,7 +253,7 @@ impl State {
                     let (log_file, created_at, p_path) = open_log_file(&self.config, true)?;
 
                     let roll_state = try_roll_state_from_criterion(
-                        rotate_config.criterion,
+                        rotate_config.criterion.clone(),
                         &self.config,
                         &p_path,
                     )?;
@@ -232,14 +271,14 @@ impl State {
                             let builder = std::thread::Builder::new()
                                 .name("flexi_logger-cleanup".to_string());
                             #[cfg(not(feature = "dont_minimize_extra_stacks"))]
-                            let builder = builder.stack_size(512 * 1024);
+                                let builder = builder.stack_size(512 * 1024);
                             let join_handle = builder.spawn(move || {
                                 while let Ok(MessageToCleanupThread::Act) = receiver.recv() {
                                     remove_or_compress_too_old_logfiles_impl(
                                         &cleanup,
                                         &filename_config,
                                     )
-                                    .ok();
+                                        .ok();
                                 }
                             })?;
                             o_cleanup_thread_handle = Some(CleanupThreadHandle {
@@ -252,7 +291,7 @@ impl State {
                         Some(RotationState {
                             naming_state,
                             roll_state,
-                            created_at,
+                            created_at: created_at.to_offset(offset!(+8)),
                             cleanup: rotate_config.cleanup,
                             o_cleanup_thread_handle,
                         }),
@@ -294,7 +333,7 @@ impl State {
 
                 let (line_writer, created_at, _) = open_log_file(&self.config, true)?;
                 *file = line_writer;
-                rotation_state.created_at = created_at;
+                rotation_state.created_at = created_at.to_offset(offset!(+8));
                 if let RollState::Size(_, ref mut current_size)
                 | RollState::AgeOrSize(_, _, ref mut current_size) = rotation_state.roll_state
                 {
@@ -446,7 +485,7 @@ fn open_log_file(
         .open(&p_path)?;
 
     #[allow(clippy::option_if_let_else)]
-    let w: Box<dyn Write + Send> = if let Some(capacity) = config.write_mode.buffersize() {
+        let w: Box<dyn Write + Send> = if let Some(capacity) = config.write_mode.buffersize() {
         Box::new(BufWriter::with_capacity(capacity, log_file))
     } else {
         Box::new(log_file)
@@ -545,23 +584,23 @@ fn remove_or_compress_too_old_logfiles_impl(
             std::fs::remove_file(&file)?;
         } else if index >= log_limit {
             #[cfg(feature = "compress")]
-            {
-                // compress, if not yet compressed
-                if let Some(extension) = file.extension() {
-                    if extension != "gz" {
-                        let mut old_file = File::open(file.clone())?;
-                        let mut compressed_file = file.clone();
-                        compressed_file.set_extension("log.gz");
-                        let mut gz_encoder = flate2::write::GzEncoder::new(
-                            File::create(compressed_file)?,
-                            flate2::Compression::fast(),
-                        );
-                        std::io::copy(&mut old_file, &mut gz_encoder)?;
-                        gz_encoder.finish()?;
-                        std::fs::remove_file(&file)?;
+                {
+                    // compress, if not yet compressed
+                    if let Some(extension) = file.extension() {
+                        if extension != "gz" {
+                            let mut old_file = File::open(file.clone())?;
+                            let mut compressed_file = file.clone();
+                            compressed_file.set_extension("log.gz");
+                            let mut gz_encoder = flate2::write::GzEncoder::new(
+                                File::create(compressed_file)?,
+                                flate2::Compression::fast(),
+                            );
+                            std::io::copy(&mut old_file, &mut gz_encoder)?;
+                            gz_encoder.finish()?;
+                            std::fs::remove_file(&file)?;
+                        }
                     }
                 }
-            }
         }
     }
 
@@ -578,13 +617,16 @@ fn rotate_output_file_to_date(
     creation_date: &OffsetDateTime,
     config: &Config,
 ) -> Result<(), std::io::Error> {
-    const INFIX_DATE: &[FormatItem<'static>] =
-        format_description!("_r[year]-[month]-[day]_[hour]-[minute]-[second]");
+    const TS_S: &str = "_r[year]-[month]-[day]T[hour]:[minute]:[second][offset_hour sign:mandatory]";
+    lazy_static::lazy_static! {
+    static ref TS: Vec<format_description::FormatItem<'static>>
+    = format_description::parse(TS_S).unwrap(/*ok*/);
+    }
 
     let current_path = config.file_spec.as_pathbuf(Some(CURRENT_INFIX));
     let mut rotated_path = config
         .file_spec
-        .as_pathbuf(Some(&creation_date.format(INFIX_DATE).unwrap()));
+        .as_pathbuf(Some(&creation_date.format(&TS).unwrap(/*ok*/)));
 
     // Search for rotated_path as is and for restart-siblings;
     // if any exists, find highest restart and add 1, else continue without restart
@@ -614,9 +656,9 @@ fn rotate_output_file_to_date(
         while (*rotated_path).exists() {
             rotated_path = config.file_spec.as_pathbuf(Some(
                 &creation_date
-                .format(INFIX_DATE)
-                .unwrap(/*ok*/)
-                .add(&format!(".restart-{:04}", number)),
+                    .format(&TS)
+                    .unwrap(/*ok*/)
+                    .add(&format!(".restart-{:04}", number)),
             ));
             number += 1;
         }
@@ -668,7 +710,7 @@ fn get_creation_date(path: &Path) -> OffsetDateTime {
     // On windows, we know that try_get_creation_date() returns a result, but it is wrong.
     // On linux, we know that try_get_creation_date() returns an error.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    return get_fake_creation_date();
+        return get_fake_creation_date();
 
     // On all others of the many platforms, we give the real creation date a try,
     // and fall back to the fake if it is not available.
@@ -689,9 +731,10 @@ fn try_get_creation_date(path: &Path) -> Result<OffsetDateTime, FlexiLoggerError
 }
 
 mod platform {
+    use std::path::Path;
+
     #[cfg(target_os = "linux")]
     use crate::util::{eprint_err, ERRCODE};
-    use std::path::Path;
 
     pub fn create_symlink_if_possible(link: &Path, path: &Path) {
         linux_create_symlink(link, path);

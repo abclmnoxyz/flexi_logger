@@ -1,7 +1,15 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
+
+// use time::macros::offset;
+use time::UtcOffset;
+
+use crate::deferred_now::now_as_year_month_day_number;
+
 /// Criterion when to rotate the log file.
 ///
 /// Used in [`Logger::rotate`](crate::Logger::rotate).
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum Criterion {
     /// Rotate the log file when it exceeds the specified size in bytes.
     Size(u64),
@@ -54,10 +62,53 @@ pub enum Criterion {
     /// See documentation for Age and Size.
     AgeOrSize(Age, u64),
 }
+//
+// #[derive(PartialEq, Eq)]
+// pub struct Date {
+//     year: i32,
+//     month: i32,
+//     day: i32,
+// }
+//
+// impl Date {
+//     pub fn new(year: i32, month: i32, day: i32) -> Self{
+//         Self {
+//             year,
+//             month,
+//             day
+//         }
+//     }
+// }
+
+#[derive(Clone, Debug)]
+pub struct SplitAtEveryNewDay {
+    pub(crate) atomic_day_number: Arc<AtomicI32>,
+    pub utc_offset: UtcOffset,
+}
+
+impl SplitAtEveryNewDay {
+    pub fn new(utc_offset: UtcOffset) -> Self {
+        Self {
+            atomic_day_number: Arc::new(AtomicI32::new(now_as_year_month_day_number(utc_offset))),
+            utc_offset,
+        }
+    }
+
+    /// utc_offset_hour should be -12 <= and <= +12
+    pub fn new_by_hour(utc_offset_hour: i8) -> Self {
+        Self::new(UtcOffset::from_hms(utc_offset_hour, 0, 0)
+            .map_err(|err| {
+                println!("could not make utc offset by param: {}, err: {:?}", utc_offset_hour, err);
+                err
+            })
+            .unwrap()
+        )
+    }
+}
 
 /// The age after which a log file rotation will be triggered,
 /// when [`Criterion::Age`] is chosen.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub enum Age {
     /// Rotate the log file when the local clock has started a new day since the
     /// current file had been created.
@@ -71,6 +122,22 @@ pub enum Age {
     /// Rotate the log file when the local clock has started a new second since the
     /// current file had been created.
     Second,
+
+    // find a more performant solution than RwLock.
+    /// Rotate the log file when a new day comes(when mid-night comes( 00:00:00 ) or after)
+    EveryNewDay(SplitAtEveryNewDay),
+}
+
+impl Age {
+    /// new with a offset
+    pub fn new_with_splitting_at_every_new_day(utc_offset: UtcOffset) -> Self {
+        Age::EveryNewDay(SplitAtEveryNewDay::new(utc_offset))
+    }
+
+    /// new with a hour number
+    pub fn new_with_splitting_at_every_new_day_by_offset_hour(utc_offset_hour: i8) -> Self {
+        Age::EveryNewDay(SplitAtEveryNewDay::new_by_hour(utc_offset_hour))
+    }
 }
 
 /// The naming convention for rotated log files.
@@ -83,10 +150,11 @@ pub enum Age {
 #[derive(Copy, Clone, Debug)]
 pub enum Naming {
     /// File rotation rotates to files with a timestamp-infix, like `"r2020-01-27_14-41-08"`.
-    Timestamps,
+    Timestamps(UtcOffset),
     /// File rotation rotates to files with a number-infix.
     Numbers,
 }
+
 /// Defines the strategy for handling older log files.
 ///
 /// Is used in [`Logger::rotate`](crate::Logger::rotate).

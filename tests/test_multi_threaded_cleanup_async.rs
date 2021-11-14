@@ -5,9 +5,10 @@ mod d {
     use flate2::bufread::GzDecoder;
     use flexi_logger::{
         Cleanup, Criterion, DeferredNow, Duplicate, FileSpec, LogSpecification, Logger, Naming,
-        Record, WriteMode, TS_DASHES_BLANK_COLONS_DOT_BLANK,
+        Record, WriteMode,
     };
     use glob::glob;
+    use lazy_static::lazy_static;
     use log::*;
     use std::collections::BTreeMap;
     use std::fs::File;
@@ -15,7 +16,7 @@ mod d {
     use std::ops::Add;
     use std::path::{Path, PathBuf};
     use std::thread::{self, JoinHandle};
-    use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
+    use time::{format_description::{self, FormatItem}, OffsetDateTime, UtcOffset};
 
     const NO_OF_THREADS: usize = 5;
     const NO_OF_LOGLINES_PER_THREAD: usize = 20_000;
@@ -45,7 +46,7 @@ mod d {
             .duplicate_to_stderr(Duplicate::Info)
             .rotate(
                 Criterion::Size(ROTATE_OVER_SIZE),
-                Naming::Timestamps,
+                Naming::Timestamps(UtcOffset::from_hms(0, 0, 0).unwrap()),
                 Cleanup::KeepLogAndCompressedFiles(NO_OF_LOG_FILES, NO_OF_GZ_FILES),
             )
             .start()
@@ -57,7 +58,7 @@ mod d {
 
         let worker_handles = start_worker_threads(NO_OF_THREADS);
         let new_spec = LogSpecification::parse("trace").unwrap();
-        thread::sleep(std::time::Duration::from_millis(500));
+        thread::sleep(std::time::Duration::from_millis(1000));
         logger.set_new_spec(new_spec);
 
         wait_for_workers_to_close(worker_handles);
@@ -102,7 +103,6 @@ mod d {
             }
             debug!("({})  writing out line number {}", thread_number, idx);
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
         trace!("MUST_BE_PRINTED");
     }
 
@@ -115,6 +115,12 @@ mod d {
         trace!("All worker threads joined.");
     }
 
+    const TS_S: &str = "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6] \
+                    [offset_hour sign:mandatory]:[offset_minute]";
+    lazy_static! {
+        static ref TS: Vec<FormatItem<'static>> = format_description::parse(TS_S).unwrap(/*ok*/);
+    }
+
     pub fn test_format(
         w: &mut dyn std::io::Write,
         now: &mut DeferredNow,
@@ -123,7 +129,7 @@ mod d {
         write!(
             w,
             "XXXXX [{}] T[{:?}] {} [{}:{}] {}",
-            now.format(TS_DASHES_BLANK_COLONS_DOT_BLANK),
+            now.now().format(&TS).unwrap(),
             thread::current().name().unwrap_or("<unnamed>"),
             record.level(),
             record.file().unwrap_or("<unnamed>"),
@@ -190,10 +196,6 @@ mod d {
             Box::new(BufReader::new(File::open(p).unwrap()))
         };
 
-        const TS: &[FormatItem<'static>] = format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6] \
-                [offset_hour sign:mandatory]:[offset_minute]"
-        );
         for line in buf_reader.lines() {
             let line = line.unwrap();
             //9 fraction digits, should be 6
