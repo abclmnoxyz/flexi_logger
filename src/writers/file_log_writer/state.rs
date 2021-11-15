@@ -80,15 +80,15 @@ impl RotationState {
             Age::EveryNewDay(SplitAtEveryNewDay { atomic_day_number, utc_offset }) => {
                 // real
                 let current_date = now.to_offset(utc_offset).date();
-                //
-                // // fake data for testing
-                // // let current_date = time::Date::from_calendar_date(2021 + now.second() as i32 / 10 , time::Month::November, current_date.day()).unwrap();
-                let current_date = time::Date::from_calendar_date(
-                    2021 + now.minute() as i32,
-                    time::Month::November,
-                    current_date.day(),
-                ).unwrap();
-                //
+                // //
+                // // // fake data for testing
+                // // // let current_date = time::Date::from_calendar_date(2021 + now.second() as i32 / 10 , time::Month::November, current_date.day()).unwrap();
+                // let current_date = time::Date::from_calendar_date(
+                //     2021 + now.minute() as i32,
+                //     time::Month::November,
+                //     current_date.day(),
+                // ).unwrap();
+                // //
 
                 let number_current = crate::deferred_now::offset_date_time_to_year_month_day_number(current_date);
 
